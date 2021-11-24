@@ -1,0 +1,97 @@
+FROM debian:buster
+
+# https://github.com/hadolint/hadolint/wiki/DL4006
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG HADOOP_VERSION=3.2.2
+ARG HBASE_VERSION=2.3.6
+ARG SPARK_VERSION=3.1.2
+
+ENV HADOOP_VERSION=${HADOOP_VERSION}
+ENV HBASE_VERSION=${HBASE_VERSION}
+ENV SPARK_VERSION=${SPARK_VERSION}
+
+# make sure needed packages are installed on the main system
+# https://linuxize.com/post/install-java-on-debian-10/
+RUN apt-get update \
+	&& apt-get install -y \
+		apt-transport-https \
+		ca-certificates \
+		wget \
+		dirmngr \
+		gnupg \
+		software-properties-common \
+		openssh-server \
+		sudo \
+		curl \
+		vim \
+	&& wget -qO - https://adoptopenjdk.jfrog.io/adoptopenjdk/api/gpg/key/public | apt-key add - \
+	&& add-apt-repository --yes https://adoptopenjdk.jfrog.io/adoptopenjdk/deb/ \
+	&& apt-get update \
+	&& apt-get install -y adoptopenjdk-8-hotspot \
+	&& echo "export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"" >> ~/.bashrc
+
+# install scala and sbt
+RUN echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | tee /etc/apt/sources.list.d/sbt.list \
+	&& echo "deb https://repo.scala-sbt.org/scalasbt/debian /" | tee /etc/apt/sources.list.d/sbt_old.list \
+	&& curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | apt-key add \
+	&& apt-get update \
+	&& apt-get install -y sbt scala
+
+RUN useradd -ms /bin/bash hadoop \
+	&& echo "hadoop:hadoop" | chpasswd \
+	&& adduser hadoop sudo \
+	# INSECURE (!!)
+	# https://dev.to/emmanuelnk/using-sudo-without-password-prompt-as-non-root-docker-user-52bg
+	&& echo "%sudo ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER hadoop
+WORKDIR /home/hadoop
+
+# set up passwordless ssh
+RUN ssh-keygen -q -t rsa -N '' -f ~/.ssh/id_rsa \
+	&& cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+
+# hadoop installation
+RUN wget https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz \
+	&& tar -xzf hadoop-${HADOOP_VERSION}.tar.gz \
+	&& rm hadoop-${HADOOP_VERSION}.tar.gz \
+	&& mkdir -p hdfs/{namenode,datanode} \
+	&& echo -e "\nexport JAVA_HOME=\"$(dirname $(dirname $(readlink -f $(which javac))))\"" >> hadoop-${HADOOP_VERSION}/etc/hadoop/hadoop-env.sh
+
+COPY tasks/TaskTwoHBase/config/hadoop/* hadoop-${HADOOP_VERSION}/etc/hadoop/
+
+# spark installation
+RUN wget https://dlcdn.apache.org/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.2.tgz \
+	&& tar -xzf spark-${SPARK_VERSION}-bin-hadoop3.2.tgz \
+	&& rm spark-${SPARK_VERSION}-bin-hadoop3.2.tgz \
+	&& cp spark-${SPARK_VERSION}-bin-hadoop3.2/conf/spark-env.sh.template spark-${SPARK_VERSION}-bin-hadoop3.2/conf/spark-env.sh \
+	&& echo -e "\nexport HADOOP_CONF_DIR=\$HADOOP_HOME/etc/hadoop" >> spark-${SPARK_VERSION}-bin-hadoop3.2/conf/spark-env.sh \
+	&& echo "export YARN_CONF_DIR=\$HADOOP_HOME/etc/hadoop" >> spark-${SPARK_VERSION}-bin-hadoop3.2/conf/spark-env.sh \
+	&& echo "export PYSPARK_PYTHON=python3" >> spark-${SPARK_VERSION}-bin-hadoop3.2/conf/spark-env.sh \
+	&& cp spark-${SPARK_VERSION}-bin-hadoop3.2/conf/workers.template spark-${SPARK_VERSION}-bin-hadoop3.2/conf/workers
+
+# HBase installation
+RUN wget https://dlcdn.apache.org/hbase/stable/hbase-${HBASE_VERSION}-bin.tar.gz \
+	&& tar -xzf hbase-${HBASE_VERSION}-bin.tar.gz \
+	&& rm hbase-${HBASE_VERSION}-bin.tar.gz \
+	&& echo -e "\nexport JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"" >> hbase-${HBASE_VERSION}/conf/hbase-env.sh \
+	&& echo "export HADOOP_HOME=/home/hadoop/hadoop-${HADOOP_VERSION}" >> hbase-${HBASE_VERSION}/conf/hbase-env.sh
+
+COPY tasks/TaskTwoHBase/config/hbase/* hbase-${HBASE_VERSION}/conf/
+
+# data and source code for the Spark app
+COPY data-hbase/* datasets/
+COPY tasks/TaskTwoHBase/app /home/hadoop/app
+
+# package the source so it can be submitted to spark
+RUN cd app && sudo sbt package
+
+COPY tasks/TaskTwoHBase/entrypoint.sh /
+RUN sudo chmod +x /entrypoint.sh
+ENTRYPOINT [ "/entrypoint.sh" ]
+
+EXPOSE 16010 9870 8088
+
+# docker build -t jvanderwolf/task-two-hbase -f Dockerfile.TaskTwo .
+# docker run --rm -p 16010:16010 -p 9870:9870 -p 8088:8088 --name task-two-hbase -it jvanderwolf/task-two-hbase
